@@ -8,11 +8,6 @@ import com.optiscan.processing.models.DetectedBubble
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * ZipGrade 100 soruluk form için balon okuyucu.
- * Düzeltilmiş görüntü 800x1100, köşe kare merkezleri (20,20)-(780,1080).
- * Sütunlar: A = 1-20, B = 21-40, C = 41-70, D = 71-100.
- */
 @Singleton
 class BubbleDetector @Inject constructor() {
 
@@ -29,16 +24,14 @@ class BubbleDetector @Inject constructor() {
         const val BUBBLE_DIAMETER = 22
         const val MAX_SINGLE_COL_ROWS = 30
 
-        // Eşikler yükseltildi: sadece gerçekten doldurulmuş balonlar işaret sayılır
-        private const val FILL_THRESHOLD = 0.45f
-        private const val AMBIGUOUS_THRESHOLD = 0.25f
+        // Değerler: balonun, kendi satırındaki medyan balondan ne kadar koyu olduğu (0-1)
+        private const val FILL_THRESHOLD = 0.18f
+        private const val AMBIGUOUS_THRESHOLD = 0.10f
 
         private const val FRAME_X = 20.0
         private const val FRAME_Y = 20.0
         private const val FRAME_W = 760.0
         private const val FRAME_H = 1060.0
-
-        // Küçültüldü: balon halkasını değil sadece iç kısmı ölçer
         private const val MEASURE_RADIUS = 6
 
         private val TOP_V = doubleArrayOf(
@@ -100,43 +93,31 @@ class BubbleDetector @Inject constructor() {
 
     fun detectBubbles(sheetMat: Mat, questionCount: Int): List<DetectedBubble> {
         val gray = Mat()
+        val background = Mat()
+        val normalized = Mat()
         var bubbles: List<DetectedBubble> = emptyList()
 
         try {
             Imgproc.cvtColor(sheetMat, gray, Imgproc.COLOR_RGBA2GRAY)
 
-            val clahe = Imgproc.createCLAHE(3.0, Size(8.0, 8.0))
-            val enhanced = Mat()
-            clahe.apply(gray, enhanced)
+            // Işık/gölge düzleştirme: görüntüyü bulanık arka planına böl
+            Imgproc.GaussianBlur(gray, background, Size(71.0, 71.0), 0.0)
+            Core.divide(gray, background, normalized, 255.0)
 
-            // Tek sabit eşik: her okumada aynı sonucu verir
-            val thresh = Mat()
-            Imgproc.adaptiveThreshold(
-                enhanced, thresh, 255.0,
-                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-                Imgproc.THRESH_BINARY_INV,
-                21, 10.0
-            )
-            enhanced.release()
-
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
-            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, kernel)
-            kernel.release()
-
-            bubbles = detectBubblesFromThresh(thresh, questionCount)
-            thresh.release()
-
+            bubbles = measureAll(normalized, questionCount)
             Log.d(TAG, "detectBubbles: qCount=$questionCount, detected=${bubbles.size}")
         } catch (e: Exception) {
             Log.e(TAG, "Bubble detection failed: ${e.message}", e)
         } finally {
             gray.release()
+            background.release()
+            normalized.release()
         }
 
         return bubbles
     }
 
-    private fun detectBubblesFromThresh(thresh: Mat, questionCount: Int): List<DetectedBubble> {
+    private fun measureAll(norm: Mat, questionCount: Int): List<DetectedBubble> {
         val bubbles = mutableListOf<DetectedBubble>()
         val n = questionCount.coerceIn(1, 100)
 
@@ -144,49 +125,45 @@ class BubbleDetector @Inject constructor() {
             val (col, v) = questionPosition(q)
             val cy = (FRAME_Y + v * FRAME_H).toInt()
 
+            val xs = IntArray(NUM_OPTIONS) { (FRAME_X + COL_U[col][it] * FRAME_W).toInt() }
+            val darkness = FloatArray(NUM_OPTIONS) { measureDarkness(norm, xs[it], cy) }
+
+            val baseline = darkness.sorted()[NUM_OPTIONS / 2]
+
             for (opt in 0 until NUM_OPTIONS) {
-                val cx = (FRAME_X + COL_U[col][opt] * FRAME_W).toInt()
-                val fillPct = measureBubbleFill(thresh, cx, cy, MEASURE_RADIUS)
-                bubbles.add(DetectedBubble(q, opt, classifyFill(fillPct), fillPct, cx, cy))
+                val fill = (darkness[opt] - baseline).coerceIn(0f, 1f)
+                bubbles.add(DetectedBubble(q, opt, classifyFill(fill), fill, xs[opt], cy))
             }
         }
         return bubbles
     }
 
-    private fun classifyFill(fillPct: Float) = when {
-        fillPct >= FILL_THRESHOLD -> BubbleState.FILLED
-        fillPct >= AMBIGUOUS_THRESHOLD -> BubbleState.AMBIGUOUS
+    private fun classifyFill(fill: Float) = when {
+        fill >= FILL_THRESHOLD -> BubbleState.FILLED
+        fill >= AMBIGUOUS_THRESHOLD -> BubbleState.AMBIGUOUS
         else -> BubbleState.EMPTY
     }
 
-    private fun measureBubbleFill(threshMat: Mat, cx: Int, cy: Int, radius: Int): Float {
-        val r = radius.coerceAtLeast(4)
+    private fun measureDarkness(norm: Mat, cx: Int, cy: Int): Float {
+        val r = MEASURE_RADIUS
         val x1 = (cx - r).coerceAtLeast(0)
         val y1 = (cy - r).coerceAtLeast(0)
-        val x2 = (cx + r).coerceAtMost(threshMat.cols() - 1)
-        val y2 = (cy + r).coerceAtMost(threshMat.rows() - 1)
-
+        val x2 = (cx + r).coerceAtMost(norm.cols() - 1)
+        val y2 = (cy + r).coerceAtMost(norm.rows() - 1)
         if (x2 <= x1 || y2 <= y1) return 0f
 
-        val roi = threshMat.submat(Rect(x1, y1, x2 - x1, y2 - y1))
+        val roi = norm.submat(Rect(x1, y1, x2 - x1, y2 - y1))
         val mask = Mat.zeros(roi.size(), CvType.CV_8UC1)
         Imgproc.circle(
             mask,
             Point((roi.cols() / 2).toDouble(), (roi.rows() / 2).toDouble()),
             r, Scalar(255.0), -1
         )
-
-        val masked = Mat()
-        Core.bitwise_and(roi, mask, masked)
-
-        val darkPixels = Core.countNonZero(masked)
-        val totalPixels = Core.countNonZero(mask)
-
+        val mean = Core.mean(roi, mask).`val`[0]
         roi.release()
         mask.release()
-        masked.release()
 
-        return if (totalPixels == 0) 0f else darkPixels.toFloat() / totalPixels.toFloat()
+        return (1.0 - mean / 255.0).toFloat().coerceIn(0f, 1f)
     }
 
     fun resolveAnswers(bubbles: List<DetectedBubble>, questionCount: Int): List<String> {
@@ -206,7 +183,6 @@ class BubbleDetector @Inject constructor() {
                         answers[q] = optionLabels.getOrElse(sorted[0].optionIndex) { "" }
                     }
                 }
-                // Belirsiz okumalar artık cevap sayılmaz, soru boş kalır
             }
         }
 
