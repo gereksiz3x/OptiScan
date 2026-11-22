@@ -22,7 +22,6 @@ class BubbleDetector @Inject constructor() {
         const val SHEET_WIDTH = 800
         const val SHEET_HEIGHT = 1100
 
-        // Diğer dosyalar kullanıyor olabilir, derleme hatası olmasın diye duruyor
         const val GRID_START_Y = 240
         const val GRID_MARGIN_X = 30
         const val GRID_BOTTOM_MARGIN = 30
@@ -30,22 +29,23 @@ class BubbleDetector @Inject constructor() {
         const val BUBBLE_DIAMETER = 22
         const val MAX_SINGLE_COL_ROWS = 30
 
-        private const val FILL_THRESHOLD = 0.32f
-        private const val AMBIGUOUS_THRESHOLD = 0.15f
+        // Eşikler yükseltildi: sadece gerçekten doldurulmuş balonlar işaret sayılır
+        private const val FILL_THRESHOLD = 0.45f
+        private const val AMBIGUOUS_THRESHOLD = 0.25f
 
         private const val FRAME_X = 20.0
         private const val FRAME_Y = 20.0
         private const val FRAME_W = 760.0
         private const val FRAME_H = 1060.0
-        private const val MEASURE_RADIUS = 8
 
-        // Üst blok (C ve D sütunlarında 41-50 / 71-80)
+        // Küçültüldü: balon halkasını değil sadece iç kısmı ölçer
+        private const val MEASURE_RADIUS = 6
+
         private val TOP_V = doubleArrayOf(
             0.0950, 0.1238, 0.1526, 0.1820, 0.2108,
             0.2396, 0.2684, 0.2971, 0.3266, 0.3554
         )
 
-        // A/B sütunları (20 satır) ve C/D sütunlarının alt 20 satırı
         private val LOWER_V = doubleArrayOf(
             0.4018, 0.4306, 0.4594, 0.4888, 0.5176,
             0.5463, 0.5751, 0.6039, 0.6333, 0.6621,
@@ -73,7 +73,6 @@ class BubbleDetector @Inject constructor() {
         val questionNumX2: Int
     )
 
-    // Eski çağrılar için duruyor, artık okumada kullanılmıyor
     fun computeLayout(questionCount: Int): GridLayout {
         return GridLayout(
             useSecondCol = true,
@@ -84,7 +83,6 @@ class BubbleDetector @Inject constructor() {
         )
     }
 
-    /** Soru indeksi (0 tabanlı) → balon merkezi y ve sütun */
     private fun questionPosition(q: Int): Pair<Int, Double> {
         return when {
             q < 20 -> Pair(0, LOWER_V[q])
@@ -102,7 +100,7 @@ class BubbleDetector @Inject constructor() {
 
     fun detectBubbles(sheetMat: Mat, questionCount: Int): List<DetectedBubble> {
         val gray = Mat()
-        val detectedBubbles = mutableListOf<DetectedBubble>()
+        var bubbles: List<DetectedBubble> = emptyList()
 
         try {
             Imgproc.cvtColor(sheetMat, gray, Imgproc.COLOR_RGBA2GRAY)
@@ -111,50 +109,31 @@ class BubbleDetector @Inject constructor() {
             val enhanced = Mat()
             clahe.apply(gray, enhanced)
 
-            val threshResults = mutableListOf<Pair<Mat, List<DetectedBubble>>>()
-            val paramSets = listOf(
-                Pair(15, 8.0),
-                Pair(21, 10.0),
-                Pair(31, 12.0)
+            // Tek sabit eşik: her okumada aynı sonucu verir
+            val thresh = Mat()
+            Imgproc.adaptiveThreshold(
+                enhanced, thresh, 255.0,
+                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+                Imgproc.THRESH_BINARY_INV,
+                21, 10.0
             )
-
-            for ((blockSize, c) in paramSets) {
-                val thresh = Mat()
-                Imgproc.adaptiveThreshold(
-                    enhanced, thresh, 255.0,
-                    Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    Imgproc.THRESH_BINARY_INV,
-                    blockSize, c
-                )
-                val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
-                Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, kernel)
-                kernel.release()
-
-                val bubbles = detectBubblesFromThresh(thresh, questionCount)
-                threshResults.add(Pair(thresh, bubbles))
-            }
-
             enhanced.release()
 
-            val best = threshResults.maxByOrNull { (_, bubbles) ->
-                val answers = resolveAnswers(bubbles, questionCount)
-                val answeredCount = answers.count { it.isNotBlank() }
-                val ambiguousCount = bubbles.count { it.state == BubbleState.AMBIGUOUS }
-                answeredCount * 10 - ambiguousCount
-            }
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
+            Imgproc.morphologyEx(thresh, thresh, Imgproc.MORPH_OPEN, kernel)
+            kernel.release()
 
-            threshResults.forEach { (mat, _) -> mat.release() }
+            bubbles = detectBubblesFromThresh(thresh, questionCount)
+            thresh.release()
 
-            if (best != null) detectedBubbles.addAll(best.second)
-
-            Log.d(TAG, "detectBubbles: qCount=$questionCount, detected=${detectedBubbles.size}")
+            Log.d(TAG, "detectBubbles: qCount=$questionCount, detected=${bubbles.size}")
         } catch (e: Exception) {
             Log.e(TAG, "Bubble detection failed: ${e.message}", e)
         } finally {
             gray.release()
         }
 
-        return detectedBubbles
+        return bubbles
     }
 
     private fun detectBubblesFromThresh(thresh: Mat, questionCount: Int): List<DetectedBubble> {
@@ -215,29 +194,19 @@ class BubbleDetector @Inject constructor() {
         val optionLabels = listOf("A", "B", "C", "D", "E")
 
         for (q in 0 until questionCount) {
-            val questionBubbles = bubbles.filter { it.questionIndex == q }
-            val filledBubbles = questionBubbles.filter { it.state == BubbleState.FILLED }
+            val filled = bubbles.filter { it.questionIndex == q && it.state == BubbleState.FILLED }
 
             when {
-                filledBubbles.size == 1 -> {
-                    answers[q] = optionLabels.getOrElse(filledBubbles[0].optionIndex) { "" }
+                filled.size == 1 -> {
+                    answers[q] = optionLabels.getOrElse(filled[0].optionIndex) { "" }
                 }
-                filledBubbles.size > 1 -> {
-                    val sorted = filledBubbles.sortedByDescending { it.fillPercentage }
+                filled.size > 1 -> {
+                    val sorted = filled.sortedByDescending { it.fillPercentage }
                     if (sorted[0].fillPercentage > sorted[1].fillPercentage * 1.5f) {
                         answers[q] = optionLabels.getOrElse(sorted[0].optionIndex) { "" }
-                    } else {
-                        answers[q] = ""
                     }
                 }
-                else -> {
-                    val ambiguous = questionBubbles.filter { it.state == BubbleState.AMBIGUOUS }
-                    if (ambiguous.size == 1) {
-                        answers[q] = optionLabels.getOrElse(ambiguous[0].optionIndex) { "" }
-                    } else {
-                        answers[q] = ""
-                    }
-                }
+                // Belirsiz okumalar artık cevap sayılmaz, soru boş kalır
             }
         }
 
